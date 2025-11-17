@@ -1,0 +1,155 @@
+#include <Joystick.h>
+
+// ======================================================
+// CONFIGURATION
+// ======================================================
+
+// Button pins (standard buttons + shifter paddles)
+const uint8_t buttonPins[] = {4, 5, 6, 7, 8, 9, 10};
+const uint8_t NUM_BUTTONS = sizeof(buttonPins) / sizeof(buttonPins[0]);
+
+// Rotary encoder pins (interrupt capable)
+const uint8_t encoderPinA = 3;   // INT0
+const uint8_t encoderPinB = 2;   // INT1
+
+// Button IDs assigned to encoder turns
+const uint8_t ENC_BUTTON_CW  = 11;
+const uint8_t ENC_BUTTON_CCW = 12;
+
+// Debounce in microseconds for encoder ISR
+const unsigned long ENCODER_DEBOUNCE_US = 100;
+
+// Micro-steps per click
+const int STEPS_PER_CLICK = 1;
+
+
+// ======================================================
+// INTERNAL STATE
+// ======================================================
+
+volatile uint8_t lastStateISR = 0;
+volatile int8_t encoderSteps = 0;
+volatile unsigned long lastChangeTime = 0;
+
+// Quadrature transition table (last<<2 | current)
+const int8_t transTable[16] = {
+  0,  1, -1,  0,
+ -1,  0,  0,  1,
+  1,  0,  0, -1,
+  0, -1,  1,  0
+};
+
+
+// ======================================================
+// JOYSTICK CONFIGURATION
+// ======================================================
+
+Joystick_ Joystick(
+  JOYSTICK_DEFAULT_REPORT_ID,
+  JOYSTICK_TYPE_GAMEPAD,
+  16, 0,            // 16 buttons, no hat switches
+  false, false, false,   // no X/Y/Z
+  false, false, false,   // no Rx/Ry/Rz
+  false, false,          // no rudder/throttle
+  false, false, false    // no accelerator/brake/clutch
+);
+
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  // Configure buttons
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
+    pinMode(buttonPins[i], INPUT_PULLUP);
+  }
+
+  // Configure encoder pins
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+
+  // Initial encoder state
+  uint8_t a = digitalRead(encoderPinA);
+  uint8_t b = digitalRead(encoderPinB);
+  lastStateISR = (a << 1) | b;
+
+  // Attach interrupts
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), isrEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(encoderPinB), isrEncoder, CHANGE);
+
+  // Manual sendState()
+  Joystick.begin(false);
+}
+
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+
+void loop() {
+
+  // ---- Read regular buttons ----
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
+    if (digitalRead(buttonPins[i]) == LOW)
+      Joystick.pressButton(i);
+  }
+
+  // ---- Fetch encoder micro-steps accumulated in ISR ----
+  noInterrupts();
+  int steps = encoderSteps;
+  encoderSteps = 0;
+  interrupts();
+
+  static int clickAccum = 0;
+
+  if (steps != 0) {
+    clickAccum += steps;
+
+    // Clockwise events
+    while (clickAccum >= STEPS_PER_CLICK) {
+      Joystick.pressButton(ENC_BUTTON_CW);
+      clickAccum -= STEPS_PER_CLICK;
+    }
+
+    // Counter-clockwise events
+    while (clickAccum <= -STEPS_PER_CLICK) {
+      Joystick.pressButton(ENC_BUTTON_CCW);
+      clickAccum += STEPS_PER_CLICK;
+    }
+  }
+
+  // ---- Send all events ----
+  Joystick.sendState();
+
+  // ---- Release everything (momentary buttons) ----
+  for (uint8_t i = 0; i < NUM_BUTTONS; i++)
+    Joystick.releaseButton(i);
+
+  Joystick.releaseButton(ENC_BUTTON_CW);
+  Joystick.releaseButton(ENC_BUTTON_CCW);
+}
+
+
+// ======================================================
+// ENCODER ISR — fast, clean, with micro-debounce
+// ======================================================
+
+void isrEncoder() {
+  unsigned long now = micros();
+  if (now - lastChangeTime < ENCODER_DEBOUNCE_US) return;
+  lastChangeTime = now;
+
+  uint8_t a = digitalRead(encoderPinA);
+  uint8_t b = digitalRead(encoderPinB);
+  uint8_t state = (a << 1) | b;
+
+  uint8_t transition = ((lastStateISR << 2) | state) & 0x0F;
+  int8_t delta = transTable[transition];
+
+  if (delta != 0)
+    encoderSteps += delta;
+
+  lastStateISR = state;
+}
